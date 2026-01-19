@@ -179,6 +179,7 @@ class TestCancelBuyFiltering:
         transactions = SchwabParser().load_from_file(csv_file)
 
         # No Cancel Buy - both transactions remain
+        # Sorted by date (oldest first)
         assert len(transactions) == 2
-        assert transactions[0].action.name == "SELL"
-        assert transactions[1].action.name == "BUY"
+        assert transactions[0].action.name == "BUY"
+        assert transactions[1].action.name == "SELL"

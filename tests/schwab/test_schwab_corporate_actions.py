@@ -73,13 +73,13 @@ class TestCorporateActionPairing:
 
         transactions = SchwabParser().load_from_file(csv_file)
 
-        # Should have 2 transactions: unified Cash Merger + Buy
-        # Note: transactions are reversed, so most recent first
+        # Should have 2 transactions: Buy + unified Cash Merger
+        # Transactions are sorted by date (oldest first)
         assert len(transactions) == 2
-        assert transactions[0].action == ActionType.CASH_MERGER
-        assert transactions[0].quantity == Decimal(100)
-        assert transactions[1].action == ActionType.BUY
-        assert transactions[1].symbol == "AAPL"
+        assert transactions[0].action == ActionType.BUY
+        assert transactions[0].symbol == "AAPL"
+        assert transactions[1].action == ActionType.CASH_MERGER
+        assert transactions[1].quantity == Decimal(100)
 
     def test_multiple_cash_mergers(self, tmp_path: Path) -> None:
         """Test multiple Cash Merger pairs are handled correctly."""
@@ -95,15 +95,15 @@ class TestCorporateActionPairing:
         transactions = SchwabParser().load_from_file(csv_file)
 
         # Should have 2 unified transactions
-        # Note: transactions are reversed, so most recent first
+        # Transactions are sorted by date (oldest first)
         assert len(transactions) == 2
 
-        # Second merger: BAR (most recent, first in reversed list)
-        assert transactions[0].symbol == "BAR"
-        assert transactions[0].quantity == Decimal(200)
-        assert transactions[0].price == Decimal(25)
+        # First merger: FOO (oldest)
+        assert transactions[0].symbol == "FOO"
+        assert transactions[0].quantity == Decimal(100)
+        assert transactions[0].price == Decimal(10)
 
-        # First merger: FOO
-        assert transactions[1].symbol == "FOO"
-        assert transactions[1].quantity == Decimal(100)
-        assert transactions[1].price == Decimal(10)
+        # Second merger: BAR (most recent)
+        assert transactions[1].symbol == "BAR"
+        assert transactions[1].quantity == Decimal(200)
+        assert transactions[1].price == Decimal(25)

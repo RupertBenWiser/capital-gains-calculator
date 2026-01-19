@@ -55,8 +55,16 @@ class AwardsTransactionsFileRequiredHeaders(str, Enum):
     """Enum to list the headers in Awards transactions file that we will use."""
 
     DATE = "Date"
+    ACTION = "Action"
     SYMBOL = "Symbol"
+    DESCRIPTION = "Description"
+    QUANTITY = "Quantity"
+    FEES_AND_COMM = "FeesAndCommissions"
+    AMOUNT = "Amount"
+    # Old format used FairMarketValuePrice, new format uses VestFairMarketValue
     FAIR_MARKET_VALUE_PRICE = "FairMarketValuePrice"
+    VEST_FAIR_MARKET_VALUE = "VestFairMarketValue"
+    VEST_DATE = "VestDate"
 
 
 @dataclass
@@ -245,10 +253,22 @@ class SchwabTransaction(BrokerTransaction):
 
     @staticmethod
     def create(
-        row_dict: OrderedDict[str, str], file: Path, awards_prices: AwardPrices
+        row_dict: OrderedDict[str, str],
+        file: Path,
+        awards_prices: AwardPrices,
+        derived_prices: dict[datetime.date, dict[str, Decimal]] | None = None,
     ) -> SchwabTransaction:
         """Create and post process a SchwabTransaction."""
         transaction = SchwabTransaction(row_dict, file)
+
+        # Handle NRA Tax Adj without symbol (e.g., withholding on interest)
+        # as an adjustment rather than dividend tax
+        if (
+            transaction.action == ActionType.DIVIDEND_TAX
+            and transaction.symbol is None
+        ):
+            transaction.action = ActionType.ADJUSTMENT
+
         if (
             transaction.price is None
             and transaction.action == ActionType.STOCK_ACTIVITY
@@ -258,10 +278,133 @@ class SchwabTransaction(BrokerTransaction):
                 raise SymbolMissingError(transaction)
             # Schwab transaction list contains sometimes incorrect date
             # for awards which don't match the PDF statements.
-            # We want to make sure to match date and price form the awards
+            # We want to make sure to match date and price from the awards
             # spreadsheet.
-            _vest_date, transaction.price = awards_prices.get(transaction.date, symbol)
+            try:
+                _vest_date, transaction.price = awards_prices.get(
+                    transaction.date, symbol
+                )
+            except KeyError:
+                # If not found in awards file, try derived prices from same-day sells
+                if derived_prices is not None:
+                    # Search same date range as AwardPrices.get does (up to 7 days back)
+                    for i in range(7):
+                        search_date = transaction.date - datetime.timedelta(days=i)
+                        if (
+                            search_date in derived_prices
+                            and symbol in derived_prices[search_date]
+                        ):
+                            transaction.price = derived_prices[search_date][symbol]
+                            LOGGER.info(
+                                "Using derived vest price for %s on %s: $%s "
+                                "(from same-day sell transaction)",
+                                symbol,
+                                transaction.date,
+                                transaction.price,
+                            )
+                            break
+                    else:
+                        raise KeyError(
+                            f"Award price is not found for symbol {symbol} "
+                            f"for date {transaction.date}"
+                        )
+                else:
+                    raise
         return transaction
+
+
+def _derive_vest_prices_from_sells(
+    lines: list[list[str]],
+    headers: list[str],
+    file: Path,
+) -> dict[datetime.date, dict[str, Decimal]]:
+    """Derive vest prices from same-day sell transactions.
+
+    For RSU vest + sell-to-cover transactions, the sell price closely approximates
+    the Fair Market Value at vest time. This is used as a fallback when the
+    Awards file doesn't contain vest price data for certain dates.
+
+    This function looks for Stock Plan Activity entries immediately followed
+    by Sell entries on the same date (or with "as of" dating) and uses the
+    sell price as the derived vest FMV.
+    """
+    derived_prices: dict[datetime.date, dict[str, Decimal]] = defaultdict(dict)
+
+    date_header = SchwabTransactionsFileRequiredHeaders.DATE.value
+    action_header = SchwabTransactionsFileRequiredHeaders.ACTION.value
+    symbol_header = SchwabTransactionsFileRequiredHeaders.SYMBOL.value
+    price_header = SchwabTransactionsFileRequiredHeaders.PRICE.value
+
+    as_of_str = " as of "
+
+    # Parse all rows into a list of dicts for easier processing
+    rows = []
+    for line in lines:
+        if not any(line):
+            continue
+        row_dict = OrderedDict(zip(headers, line, strict=True))
+        rows.append(row_dict)
+
+    # Look for Stock Plan Activity followed by same-day Sell
+    for i, row in enumerate(rows):
+        if row[action_header] != "Stock Plan Activity":
+            continue
+
+        # Get the activity date
+        date_str = row[date_header]
+        if as_of_str in date_str:
+            # Use the "as of" date for matching
+            date_str = date_str[date_str.find(as_of_str) + len(as_of_str) :]
+        try:
+            activity_date = datetime.datetime.strptime(date_str, "%m/%d/%Y").date()
+        except ValueError:
+            continue
+
+        symbol = row[symbol_header]
+        if not symbol:
+            continue
+
+        symbol = TICKER_RENAMES.get(symbol, symbol)
+
+        # Look for a Sell on the same "as of" date nearby (search up to 3 rows)
+        for j in range(max(0, i - 3), min(len(rows), i + 4)):
+            if j == i:
+                continue
+            sell_row = rows[j]
+            if sell_row[action_header] != "Sell":
+                continue
+            if sell_row[symbol_header] != row[symbol_header]:
+                continue
+
+            # Check if the sell date matches (with "as of" support)
+            sell_date_str = sell_row[date_header]
+            if as_of_str in sell_date_str:
+                sell_date_str = sell_date_str[
+                    sell_date_str.find(as_of_str) + len(as_of_str) :
+                ]
+            try:
+                sell_date = datetime.datetime.strptime(sell_date_str, "%m/%d/%Y").date()
+            except ValueError:
+                continue
+
+            # Allow a small date range (vest might be a few days off from sell
+            # due to weekends/holidays - "as of" dates can be up to 4 days apart)
+            if abs((sell_date - activity_date).days) <= 4:
+                price_str = sell_row[price_header]
+                if price_str:
+                    price = Decimal(price_str.replace("$", "").replace(",", ""))
+                    # Use the activity date as the key (that's when we need the FMV)
+                    derived_prices[activity_date][symbol] = price
+                    LOGGER.debug(
+                        "Derived vest price for %s on %s: $%s from sell on %s",
+                        symbol,
+                        activity_date,
+                        price,
+                        sell_date,
+                    )
+                break
+
+    return dict(derived_prices)
 
 
 def _combine_cash_merger_pair(
@@ -533,42 +676,23 @@ def _filter_cancelled_buy_transactions(
     return [txn for i, txn in enumerate(transactions) if i not in indices_to_remove]
 
 
-def _read_schwab_awards(
-    schwab_award_transactions_file: Path | None,
+def _read_schwab_awards_old_format(
+    lines: list[list[str]],
+    headers: list[str],
+    schwab_award_transactions_file: Path,
 ) -> AwardPrices:
-    """Read initial stock prices from CSV file."""
-    if schwab_award_transactions_file is None:
-        return AwardPrices(award_prices={})
-
+    """Read awards from old format (paired rows with FairMarketValuePrice)."""
     initial_prices: dict[datetime.date, dict[str, Decimal]] = defaultdict(dict)
-    headers = []
-    lines = []
-
-    with schwab_award_transactions_file.open(encoding="utf-8") as csv_file:
-        print(f"Parsing {schwab_award_transactions_file}...")
-        lines = list(csv.reader(csv_file))
-    if not lines:
-        raise ParsingError(
-            schwab_award_transactions_file, "Charles Schwab Award CSV file is empty"
-        )
-    headers = lines[0]
-    required_headers = set(
-        {header.value for header in AwardsTransactionsFileRequiredHeaders}
-    )
-    if not required_headers.issubset(headers):
-        raise ParsingError(
-            schwab_award_transactions_file,
-            f"Missing columns in awards file: {required_headers.difference(headers)}",
-        )
-
-    # Remove headers
-    lines = lines[1:]
 
     modulo = len(lines) % 2
     if modulo != 0:
         raise UnexpectedRowCountError(
             len(lines) - modulo + 2, schwab_award_transactions_file
         )
+
+    date_column = AwardsTransactionsFileRequiredHeaders.DATE.value
+    symbol_header = AwardsTransactionsFileRequiredHeaders.SYMBOL.value
+    price_column = AwardsTransactionsFileRequiredHeaders.FAIR_MARKET_VALUE_PRICE.value
 
     for upper_row, lower_row in zip(lines[::2], lines[1::2], strict=True):
         # in this format each row is split into two rows,
@@ -584,26 +708,295 @@ def _read_schwab_awards(
             )
 
         row_dict = OrderedDict(zip(headers, row, strict=True))
-        date_header = AwardsTransactionsFileRequiredHeaders.DATE.value
-        date_str = row_dict[date_header]
+        date_str = row_dict[date_column]
         try:
             date = datetime.datetime.strptime(date_str, "%Y/%m/%d").date()
         except ValueError:
             date = datetime.datetime.strptime(date_str, "%m/%d/%Y").date()
-        symbol_header = AwardsTransactionsFileRequiredHeaders.SYMBOL.value
         symbol = row_dict[symbol_header] if row_dict[symbol_header] != "" else None
-        fair_market_value_price_header = (
-            AwardsTransactionsFileRequiredHeaders.FAIR_MARKET_VALUE_PRICE.value
-        )
         price = (
-            Decimal(row_dict[fair_market_value_price_header].replace("$", ""))
-            if row_dict[fair_market_value_price_header] != ""
+            Decimal(row_dict[price_column].replace("$", ""))
+            if row_dict[price_column] != ""
             else None
         )
         if symbol is not None and price is not None:
             symbol = TICKER_RENAMES.get(symbol, symbol)
             initial_prices[date][symbol] = price
+
     return AwardPrices(award_prices=dict(initial_prices))
+
+
+def _read_schwab_awards_new_format(
+    lines: list[list[str]],
+    headers: list[str],
+) -> AwardPrices:
+    """Read awards from new format (VestDate and VestFairMarketValue columns).
+
+    New format has different row structures:
+    - Sale/Wire Transfer/Dividend rows may have multiple detail rows
+    - Deposit rows follow the 2-row pattern (header + detail)
+    - We extract VestDate and VestFairMarketValue from any row that has them
+    """
+    initial_prices: dict[datetime.date, dict[str, Decimal]] = defaultdict(dict)
+
+    date_column = AwardsTransactionsFileRequiredHeaders.VEST_DATE.value
+    symbol_header = AwardsTransactionsFileRequiredHeaders.SYMBOL.value
+    price_column = AwardsTransactionsFileRequiredHeaders.VEST_FAIR_MARKET_VALUE.value
+
+    date_idx = headers.index(date_column)
+    symbol_idx = headers.index(symbol_header)
+    price_idx = headers.index(price_column)
+
+    # Track current symbol from main rows (Deposit rows have symbol)
+    current_symbol: str | None = None
+
+    for row in lines:
+        if len(row) != len(headers):
+            continue
+
+        # Update current symbol if this row has one
+        if row[symbol_idx]:
+            current_symbol = row[symbol_idx]
+
+        # Extract vest date and price if present
+        date_str = row[date_idx]
+        price_str = row[price_idx]
+
+        if date_str and price_str:
+            try:
+                date = datetime.datetime.strptime(date_str, "%Y/%m/%d").date()
+            except ValueError:
+                date = datetime.datetime.strptime(date_str, "%m/%d/%Y").date()
+
+            price = Decimal(price_str.replace("$", "").replace(",", ""))
+
+            if current_symbol is not None:
+                symbol = TICKER_RENAMES.get(current_symbol, current_symbol)
+                initial_prices[date][symbol] = price
+
+    return AwardPrices(award_prices=dict(initial_prices))
+
+
+def _read_schwab_awards_transactions_new_format(
+    lines: list[list[str]],
+    headers: list[str],
+    file_path: Path,  # noqa: ARG001
+    award_prices: AwardPrices,
+) -> list[BrokerTransaction]:
+    """Extract actual transactions from new format awards file.
+
+    The new format contains:
+    - Deposit rows: RSU vest (Stock Plan Activity) - acquisition
+    - Sale rows: Sell-to-cover transactions - disposal
+    - Wire Transfer, Dividend, Tax Withholding: ancillary
+
+    Sale rows have detail rows beneath them showing which lots were sold,
+    with VestDate and VestFairMarketValue for each lot.
+    """
+    transactions: list[BrokerTransaction] = []
+
+    # Get column indices
+    date_idx = headers.index(AwardsTransactionsFileRequiredHeaders.DATE.value)
+    action_idx = headers.index(AwardsTransactionsFileRequiredHeaders.ACTION.value)
+    symbol_idx = headers.index(AwardsTransactionsFileRequiredHeaders.SYMBOL.value)
+    desc_idx = headers.index(AwardsTransactionsFileRequiredHeaders.DESCRIPTION.value)
+    qty_idx = headers.index(AwardsTransactionsFileRequiredHeaders.QUANTITY.value)
+    fees_idx = headers.index(AwardsTransactionsFileRequiredHeaders.FEES_AND_COMM.value)
+    amount_idx = headers.index(AwardsTransactionsFileRequiredHeaders.AMOUNT.value)
+    vest_fmv_idx = headers.index(
+        AwardsTransactionsFileRequiredHeaders.VEST_FAIR_MARKET_VALUE.value
+    )
+
+    current_symbol: str | None = None
+
+    for row in lines:
+        if len(row) != len(headers):
+            continue
+
+        # Update current symbol if this row has one
+        if row[symbol_idx]:
+            current_symbol = row[symbol_idx]
+
+        date_str = row[date_idx]
+        action = row[action_idx]
+
+        if not date_str or not action:
+            continue
+
+        # Parse date
+        try:
+            date = datetime.datetime.strptime(date_str, "%m/%d/%Y").date()
+        except ValueError:
+            try:
+                date = datetime.datetime.strptime(date_str, "%Y/%m/%d").date()
+            except ValueError:
+                continue
+
+        symbol = current_symbol
+        if symbol:
+            symbol = TICKER_RENAMES.get(symbol, symbol)
+
+        description = row[desc_idx]
+
+        # Parse quantity
+        qty_str = row[qty_idx]
+        quantity = (
+            Decimal(qty_str.replace(",", ""))
+            if qty_str
+            else None
+        )
+
+        # Parse fees
+        fees_str = row[fees_idx]
+        fees = (
+            Decimal(fees_str.replace("$", "").replace(",", ""))
+            if fees_str
+            else Decimal(0)
+        )
+
+        # Parse amount
+        amount_str = row[amount_idx]
+        amount = (
+            Decimal(amount_str.replace("$", "").replace(",", ""))
+            if amount_str
+            else None
+        )
+
+        if action == "Sale" and symbol and quantity:
+            # This is a sell transaction
+            # The main Sale row doesn't have SalePrice - it's in the detail rows.
+            # Calculate price from amount/quantity for the main Sale row.
+            # Note: amount already has fees deducted, so we add fees back to get gross
+            price = None
+            if amount is not None and quantity > 0:
+                # Amount is net proceeds (after fees), so gross = amount + fees
+                gross_amount = amount + fees
+                price = gross_amount / quantity
+
+            txn = BrokerTransaction(
+                date=date,
+                action=ActionType.SELL,
+                symbol=symbol,
+                description=description,
+                quantity=quantity,
+                price=price,
+                fees=fees,
+                amount=amount,
+                currency="USD",
+                broker="Charles Schwab",
+            )
+            transactions.append(txn)
+            LOGGER.debug(
+                "Extracted Sale from awards file: %s %s @ $%s on %s",
+                quantity,
+                symbol,
+                price,
+                date,
+            )
+
+        elif action == "Deposit" and symbol and quantity:
+            # This is a stock plan activity (RSU vest)
+            # Get vest price from award_prices or from the detail row
+            vest_fmv_str = row[vest_fmv_idx]
+
+            price = None
+            if vest_fmv_str:
+                price = Decimal(vest_fmv_str.replace("$", "").replace(",", ""))
+            elif award_prices:
+                try:
+                    _, price = award_prices.get(date, symbol)
+                except KeyError:
+                    pass
+
+            txn = BrokerTransaction(
+                date=date,
+                action=ActionType.STOCK_ACTIVITY,
+                symbol=symbol,
+                description=description,
+                quantity=quantity,
+                price=price,
+                fees=fees,
+                amount=None,
+                currency="USD",
+                broker="Charles Schwab",
+            )
+            transactions.append(txn)
+            LOGGER.debug(
+                "Extracted Deposit from awards file: %s %s @ $%s on %s",
+                quantity,
+                symbol,
+                price,
+                date,
+            )
+
+    return transactions
+
+
+def _read_schwab_awards(
+    schwab_award_transactions_file: Path | None,
+) -> tuple[AwardPrices, list[BrokerTransaction]]:
+    """Read initial stock prices and transactions from CSV file.
+
+    Returns:
+        Tuple of (AwardPrices for vest FMV lookup, list of transactions from awards file)
+    """
+    if schwab_award_transactions_file is None:
+        return AwardPrices(award_prices={}), []
+
+    headers: list[str] = []
+    lines: list[list[str]] = []
+
+    with schwab_award_transactions_file.open(encoding="utf-8") as csv_file:
+        print(f"Parsing {schwab_award_transactions_file}...")
+        lines = list(csv.reader(csv_file))
+    if not lines:
+        raise ParsingError(
+            schwab_award_transactions_file, "Charles Schwab Award CSV file is empty"
+        )
+    headers = lines[0]
+
+    # Detect format: new format has VestFairMarketValue, old has FairMarketValuePrice
+    old_price_header = AwardsTransactionsFileRequiredHeaders.FAIR_MARKET_VALUE_PRICE
+    new_price_header = AwardsTransactionsFileRequiredHeaders.VEST_FAIR_MARKET_VALUE
+    new_date_header = AwardsTransactionsFileRequiredHeaders.VEST_DATE
+
+    is_new_format = new_price_header.value in headers
+
+    if is_new_format:
+        # New format: require VestFairMarketValue and VestDate
+        required_headers = {
+            AwardsTransactionsFileRequiredHeaders.SYMBOL.value,
+            new_price_header.value,
+            new_date_header.value,
+        }
+    else:
+        # Old format: require Date and FairMarketValuePrice
+        required_headers = {
+            AwardsTransactionsFileRequiredHeaders.DATE.value,
+            AwardsTransactionsFileRequiredHeaders.SYMBOL.value,
+            old_price_header.value,
+        }
+
+    if not required_headers.issubset(headers):
+        raise ParsingError(
+            schwab_award_transactions_file,
+            f"Missing columns in awards file: {required_headers.difference(headers)}",
+        )
+
+    # Remove headers
+    lines = lines[1:]
+
+    if is_new_format:
+        award_prices = _read_schwab_awards_new_format(lines, headers)
+        # Extract actual transactions from the new format awards file
+        award_transactions = _read_schwab_awards_transactions_new_format(
+            lines, headers, schwab_award_transactions_file, award_prices
+        )
+        return award_prices, award_transactions
+
+    return _read_schwab_awards_old_format(
+        lines, headers, schwab_award_transactions_file
+    ), []
 
 
 class SchwabParser(BaseSingleFileParser):
@@ -614,7 +1007,8 @@ class SchwabParser(BaseSingleFileParser):
     format_name = "CSV"
     deprecated_flags: ClassVar[list[str]] = ["--schwab"]
 
-    awards_prices: AwardPrices = _read_schwab_awards(None)
+    awards_prices: AwardPrices = AwardPrices(award_prices={})
+    awards_transactions: list[BrokerTransaction] = []
 
     @classmethod
     def register_arguments(cls, arg_group: argparse._ArgumentGroup) -> None:
@@ -639,7 +1033,7 @@ class SchwabParser(BaseSingleFileParser):
     def load_from_args(cls, args: argparse.Namespace) -> list[BrokerTransaction]:
         """Load broker data from parsed arguments."""
         award_path = args.schwab_award_file
-        cls.awards_prices = _read_schwab_awards(award_path)
+        cls.awards_prices, cls.awards_transactions = _read_schwab_awards(award_path)
         return super().load_from_args(args)
 
     @classmethod
@@ -669,16 +1063,53 @@ class SchwabParser(BaseSingleFileParser):
 
         # Remove header
         lines = lines[1:]
-        transactions = [
+
+        # Derive vest prices from same-day sell transactions as a fallback
+        # for when the awards file doesn't have vest data for certain dates
+        derived_prices = _derive_vest_prices_from_sells(lines, headers, file_path)
+
+        transactions: list[BrokerTransaction] = [
             SchwabTransaction.create(
                 OrderedDict(zip(headers, row, strict=True)),
                 file_path,
                 cls.awards_prices,
+                derived_prices,
             )
             for row in lines
             if any(row)
         ]
         transactions = _unify_schwab_paired_transactions(transactions, file_path)
         transactions = _filter_cancelled_buy_transactions(transactions)
-        transactions.reverse()
+
+        # Add transactions from the awards file (Deposits and Sales)
+        # These are tracked separately from the Individual account
+        if cls.awards_transactions:
+            transactions.extend(cls.awards_transactions)
+            LOGGER.info(
+                "Added %d transactions from awards file",
+                len(cls.awards_transactions),
+            )
+
+        # Sort transactions by date, ensuring acquisitions come before disposals.
+        # Action order priority for same date:
+        # 0: Acquisitions (Buy, Stock Activity, Reinvest Shares, etc.)
+        # 1: Everything else (Sell, Cash Merger, Transfers, etc.)
+        def action_sort_key(action: ActionType) -> int:
+            if action in (
+                ActionType.BUY,
+                ActionType.STOCK_ACTIVITY,
+                ActionType.REINVEST_SHARES,
+                ActionType.SPIN_OFF,
+                ActionType.STOCK_SPLIT,
+            ):
+                return 0
+            return 1
+
+        transactions.sort(
+            key=lambda t: (
+                t.date,
+                action_sort_key(t.action),
+                t.symbol or "",
+            )
+        )
         return list(transactions)
